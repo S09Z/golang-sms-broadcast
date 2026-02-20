@@ -1,0 +1,29 @@
+# VCS
+.git
+.gitignore
+
+# Editor/OS
+.DS_Store
+.vscode
+.idea
+
+# Local env/secrets
+.env
+.env.*
+
+# Build outputs
+bin
+dist
+out
+tmp
+coverage
+*.log
+
+# Docs/tests/load (keep out of runtime images)
+test
+**/*_test.go
+deployments/rabbitmq/definitions.json
+
+# Local compose/dev files
+docker-compose.yml
+Makefile
