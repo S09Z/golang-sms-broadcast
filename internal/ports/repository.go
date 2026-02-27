@@ -13,6 +13,9 @@ type MessageRepository interface {
 	// SaveBroadcast persists a new Broadcast.
 	SaveBroadcast(ctx context.Context, b domain.Broadcast) error
 
+	// GetBroadcast retrieves a broadcast by ID with all its messages.
+	GetBroadcast(ctx context.Context, id uuid.UUID) (*domain.Broadcast, error)
+
 	// SaveMessages persists a batch of Messages in a single transaction.
 	SaveMessages(ctx context.Context, msgs []domain.Message) error
 

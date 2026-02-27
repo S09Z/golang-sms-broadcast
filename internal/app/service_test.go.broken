@@ -1,0 +1,362 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"os"
+	"testing"
+
+	"golang-sms-broadcast/internal/domain"
+
+	"github.com/google/uuid"
+)
+
+// Mock Repository
+type mockRepository struct {
+	broadcasts map[uuid.UUID]*domain.Broadcast
+	messages   map[uuid.UUID]*domain.Message
+	err        error
+}
+
+func newMockRepository() *mockRepository {
+	return &mockRepository{
+		broadcasts: make(map[uuid.UUID]*domain.Broadcast),
+		messages:   make(map[uuid.UUID]*domain.Message),
+	}
+}
+
+func (m *mockRepository) CreateBroadcast(ctx context.Context, b *domain.Broadcast) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.broadcasts[b.ID] = b
+	return nil
+}
+
+func (m *mockRepository) GetBroadcast(ctx context.Context, id uuid.UUID) (*domain.Broadcast, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	b, ok := m.broadcasts[id]
+	if !ok {
+		return nil, errors.New("broadcast not found")
+	}
+	return b, nil
+}
+
+func (m *mockRepository) CreateMessage(ctx context.Context, msg *domain.Message) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.messages[msg.ID] = msg
+	return nil
+}
+
+func (m *mockRepository) UpdateMessageStatus(ctx context.Context, id uuid.UUID, status domain.Status, providerID string) error {
+	if m.err != nil {
+		return m.err
+	}
+	msg, ok := m.messages[id]
+	if !ok {
+		return errors.New("message not found")
+	}
+	msg.Status = status
+	msg.ProviderID = providerID
+	return nil
+}
+
+func (m *mockRepository) GetPendingMessages(ctx context.Context, limit int) ([]domain.Message, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	var pending []domain.Message
+	for _, msg := range m.messages {
+		if msg.Status == domain.StatusPending {
+			pending = append(pending, *msg)
+			if len(pending) >= limit {
+				break
+			}
+		}
+	}
+	return pending, nil
+}
+
+func (m *mockRepository) Ping(ctx context.Context) error {
+	return m.err
+}
+
+func (m *mockRepository) Close() error {
+	return nil
+}
+
+// Mock Publisher
+type mockPublisher struct {
+	published []domain.Message
+	err       error
+}
+
+func newMockPublisher() *mockPublisher {
+	return &mockPublisher{
+		published: make([]domain.Message, 0),
+	}
+}
+
+func (m *mockPublisher) PublishMessage(ctx context.Context, msg domain.Message) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.published = append(m.published, msg)
+	return nil
+}
+
+func (m *mockPublisher) Close() error {
+	return nil
+}
+
+// Mock Provider
+type mockProvider struct {
+	sendResult string
+	err        error
+}
+
+func (m *mockProvider) SendSMS(ctx context.Context, to, body string) (string, error) {
+	if m.err != nil {
+		return "", m.err
+	}
+	return m.sendResult, nil
+}
+
+func TestBroadcastService_CreateBroadcast(t *testing.T) {
+	repo := newMockRepository()
+	publisher := newMockPublisher()
+	provider := &mockProvider{}
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	svc := NewBroadcastService(repo, publisher, provider, log)
+
+	tests := []struct {
+		name       string
+		broadName  string
+		body       string
+		recipients []string
+		wantErr    bool
+	}{
+		{
+			name:       "valid broadcast",
+			broadName:  "Test Campaign",
+			body:       "Hello World",
+			recipients: []string{"+66812345678", "+66898765432"},
+			wantErr:    false,
+		},
+		{
+			name:       "empty name",
+			broadName:  "",
+			body:       "Hello",
+			recipients: []string{"+66812345678"},
+			wantErr:    true,
+		},
+		{
+			name:       "empty body",
+			broadName:  "Test",
+			body:       "",
+			recipients: []string{"+66812345678"},
+			wantErr:    true,
+		},
+		{
+			name:       "no recipients",
+			broadName:  "Test",
+			body:       "Hello",
+			recipients: []string{},
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			broadcastID, err := svc.CreateBroadcast(ctx, tt.broadName, tt.body, tt.recipients)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CreateBroadcast() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				if broadcastID == uuid.Nil {
+					t.Error("Expected non-nil broadcast ID")
+				}
+
+				// Verify broadcast was created
+				if _, ok := repo.broadcasts[broadcastID]; !ok {
+					t.Error("Broadcast not found in repository")
+				}
+
+				// Verify messages were created
+				messageCount := 0
+				for _, msg := range repo.messages {
+					if msg.BroadcastID == broadcastID {
+						messageCount++
+					}
+				}
+				if messageCount != len(tt.recipients) {
+					t.Errorf("Expected %d messages, got %d", len(tt.recipients), messageCount)
+				}
+			}
+		})
+	}
+}
+
+func TestBroadcastService_CreateBroadcast_RepositoryError(t *testing.T) {
+	repo := newMockRepository()
+	repo.err = errors.New("database error")
+	publisher := newMockPublisher()
+	provider := &mockProvider{}
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	svc := NewBroadcastService(repo, publisher, provider, log)
+
+	ctx := context.Background()
+	_, err := svc.CreateBroadcast(ctx, "Test", "Hello", []string{"+66812345678"})
+
+	if err == nil {
+		t.Error("Expected error when repository fails")
+	}
+}
+
+func TestBroadcastService_SendMessage(t *testing.T) {
+	repo := newMockRepository()
+	publisher := newMockPublisher()
+	provider := &mockProvider{
+		sendResult: "provider-msg-123",
+	}
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	svc := NewBroadcastService(repo, publisher, provider, log)
+
+	// Create a test message
+	msg := &domain.Message{
+		ID:     uuid.New(),
+		To:     "+66812345678",
+		Body:   "Test message",
+		Status: domain.StatusPending,
+	}
+	repo.messages[msg.ID] = msg
+
+	ctx := context.Background()
+	err := svc.SendMessage(ctx, *msg)
+
+	if err != nil {
+		t.Errorf("SendMessage() error = %v", err)
+	}
+
+	// Verify message status was updated
+	updatedMsg := repo.messages[msg.ID]
+	if updatedMsg.Status != domain.StatusSent {
+		t.Errorf("Expected status %v, got %v", domain.StatusSent, updatedMsg.Status)
+	}
+
+	if updatedMsg.ProviderID != "provider-msg-123" {
+		t.Errorf("Expected provider ID 'provider-msg-123', got '%v'", updatedMsg.ProviderID)
+	}
+}
+
+func TestBroadcastService_SendMessage_ProviderError(t *testing.T) {
+	repo := newMockRepository()
+	publisher := newMockPublisher()
+	provider := &mockProvider{
+		err: errors.New("provider error"),
+	}
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	svc := NewBroadcastService(repo, publisher, provider, log)
+
+	msg := &domain.Message{
+		ID:     uuid.New(),
+		To:     "+66812345678",
+		Body:   "Test message",
+		Status: domain.StatusPending,
+	}
+	repo.messages[msg.ID] = msg
+
+	ctx := context.Background()
+	err := svc.SendMessage(ctx, *msg)
+
+	if err == nil {
+		t.Error("Expected error when provider fails")
+	}
+
+	// Verify message status was updated to failed
+	updatedMsg := repo.messages[msg.ID]
+	if updatedMsg.Status != domain.StatusFailed {
+		t.Errorf("Expected status %v, got %v", domain.StatusFailed, updatedMsg.Status)
+	}
+}
+
+func TestBroadcastService_HandleDLR(t *testing.T) {
+	repo := newMockRepository()
+	publisher := newMockPublisher()
+	provider := &mockProvider{}
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+
+	svc := NewBroadcastService(repo, publisher, provider, log)
+
+	// Create a test message
+	msgID := uuid.New()
+	msg := &domain.Message{
+		ID:         msgID,
+		To:         "+66812345678",
+		Body:       "Test",
+		Status:     domain.StatusSent,
+		ProviderID: "provider-123",
+	}
+	repo.messages[msgID] = msg
+
+	tests := []struct {
+		name           string
+		providerID     string
+		status         string
+		expectedStatus domain.Status
+		wantErr        bool
+	}{
+		{
+			name:           "delivered status",
+			providerID:     "provider-123",
+			status:         "delivered",
+			expectedStatus: domain.StatusDelivered,
+			wantErr:        false,
+		},
+		{
+			name:           "failed status",
+			providerID:     "provider-123",
+			status:         "failed",
+			expectedStatus: domain.StatusFailed,
+			wantErr:        false,
+		},
+		{
+			name:       "unknown status",
+			providerID: "provider-123",
+			status:     "unknown",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			err := svc.HandleDLR(ctx, tt.providerID, tt.status)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("HandleDLR() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr {
+				// Verify status was updated
+				if msg.Status != tt.expectedStatus {
+					t.Errorf("Expected status %v, got %v", tt.expectedStatus, msg.Status)
+				}
+			}
+		})
+	}
+}

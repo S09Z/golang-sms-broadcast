@@ -1,0 +1,86 @@
+package httpmock
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func TestProvider_SendSMS(t *testing.T) {
+	tests := []struct {
+		name        string
+		providerURL string
+		to          string
+		body        string
+		wantErr     bool
+	}{
+		{
+			name:        "valid SMS",
+			providerURL: "http://localhost:9090",
+			to:          "+66812345678",
+			body:        "Test message",
+			wantErr:     false,
+		},
+		{
+			name:        "empty phone number",
+			providerURL: "http://localhost:9090",
+			to:          "",
+			body:        "Test",
+			wantErr:     false, // Provider doesn't validate
+		},
+		{
+			name:        "empty body",
+			providerURL: "http://localhost:9090",
+			to:          "+66812345678",
+			body:        "",
+			wantErr:     false, // Provider doesn't validate
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := New(tt.providerURL)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			msgID, err := provider.SendSMS(ctx, tt.to, tt.body)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("SendSMS() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+
+			if !tt.wantErr && msgID == "" {
+				t.Error("Expected non-empty message ID")
+			}
+		})
+	}
+}
+
+func TestProvider_InvalidURL(t *testing.T) {
+	provider := New("http://invalid-host-that-does-not-exist:9999")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := provider.SendSMS(ctx, "+66812345678", "Test")
+
+	if err == nil {
+		t.Error("Expected error when connecting to invalid host")
+	}
+}
+
+func TestProvider_Timeout(t *testing.T) {
+	provider := New("http://localhost:9090")
+
+	// Very short timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
+	defer cancel()
+
+	_, err := provider.SendSMS(ctx, "+66812345678", "Test")
+
+	if err == nil {
+		t.Error("Expected timeout error")
+	}
+}

@@ -16,7 +16,7 @@ func FromEnv() Config {
 	return Config{
 		HTTPAddr:      getenv("HTTP_ADDR", ":8080"),
 		DatabaseURL:   getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/sms?sslmode=disable"),
-		AMQPURL:       getenv("AMQP_URL", "amqp://guest:guest@localhost:5672/"),
+		AMQPURL:       getenv("AMQP_URL", "amqp://admin:admin123@localhost:5672/"),
 		ProviderURL:   getenv("PROVIDER_URL", "http://localhost:9090"),
 		DLRWebhookURL: getenv("DLR_WEBHOOK_URL", "http://localhost:8081/dlr"),
 	}

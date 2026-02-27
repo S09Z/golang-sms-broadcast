@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,54 +12,60 @@ import (
 	"golang-sms-broadcast/internal/adapters/provider/httpmock"
 	"golang-sms-broadcast/internal/adapters/queue/rabbitmq"
 	"golang-sms-broadcast/internal/app"
+	cfg "golang-sms-broadcast/internal/config"
 	"golang-sms-broadcast/internal/domain"
-
-	cfg "golang-sms-broadcast/config"
 )
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true,
+	}))
 
+	if err := run(log); err != nil {
+		log.Error("application failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(log *slog.Logger) error {
 	conf := cfg.FromEnv()
 
-	// ── Adapters ─────────────────────────────────────────────────────────────
+	// ── Initialize dependencies ──────────────────────────────────────────────
 	repo, err := postgres.New(conf.DatabaseURL)
 	if err != nil {
-		log.Error("connect postgres", "err", err)
-		os.Exit(1)
+		return errors.New("failed to connect to postgres: " + err.Error())
 	}
 	defer repo.Close()
 
-	publisher, err := rabbitmq.NewPublisher(conf.AMQPURL)
-	if err != nil {
-		log.Error("connect rabbitmq publisher", "err", err)
-		os.Exit(1)
-	}
-	defer publisher.Close()
-
 	consumer, err := rabbitmq.NewConsumer(conf.AMQPURL, log)
 	if err != nil {
-		log.Error("connect rabbitmq consumer", "err", err)
-		os.Exit(1)
+		return errors.New("failed to connect to rabbitmq consumer: " + err.Error())
 	}
 	defer consumer.Close()
 
 	provider := httpmock.New(conf.ProviderURL)
 
-	// ── Application service ──────────────────────────────────────────────────
-	svc := app.NewBroadcastService(repo, publisher, provider, log)
+	// Sender worker doesn't need publisher
+	svc := app.NewBroadcastService(repo, nil, provider, log)
 
+	// ── Setup consumer ───────────────────────────────────────────────────────
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	log.Info("sender-worker started")
 
+	// Consume blocks until context is cancelled or fatal error
 	if err := consumer.Consume(ctx, func(ctx context.Context, msg domain.Message) error {
 		return svc.SendMessage(ctx, msg)
-	}); err != nil && ctx.Err() == nil {
-		log.Error("consumer error", "err", err)
-		os.Exit(1)
+	}); err != nil {
+		// If context was cancelled, it's a graceful shutdown
+		if ctx.Err() != nil {
+			log.Info("shutdown signal received")
+			return nil
+		}
+		return errors.New("consumer error: " + err.Error())
 	}
 
-	log.Info("shutting down sender-worker")
+	log.Info("sender-worker stopped gracefully")
+	return nil
 }

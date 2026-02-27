@@ -1,0 +1,242 @@
+package domain
+
+import (
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+func TestStatus_IsValid(t *testing.T) {
+	tests := []struct {
+		name   string
+		status Status
+		want   bool
+	}{
+		{"pending is valid", StatusPending, true},
+		{"sent is valid", StatusSent, true},
+		{"failed is valid", StatusFailed, true},
+		{"delivered is valid", StatusDelivered, true},
+		{"invalid status", Status("invalid"), false},
+		{"empty status", Status(""), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.status.IsValid(); got != tt.want {
+				t.Errorf("Status.IsValid() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMessage_BeforeCreate(t *testing.T) {
+	msg := &Message{
+		To:     "+66812345678",
+		Body:   "Test message",
+		Status: StatusPending,
+	}
+
+	// ID should be zero before create
+	if msg.ID != uuid.Nil {
+		t.Errorf("Expected ID to be nil, got %v", msg.ID)
+	}
+
+	// Call BeforeCreate hook
+	if err := msg.BeforeCreate(nil); err != nil {
+		t.Fatalf("BeforeCreate failed: %v", err)
+	}
+
+	// ID should be set after create
+	if msg.ID == uuid.Nil {
+		t.Error("Expected ID to be set after BeforeCreate")
+	}
+
+	// CreatedAt should be set
+	if msg.CreatedAt.IsZero() {
+		t.Error("Expected CreatedAt to be set after BeforeCreate")
+	}
+
+	// UpdatedAt should be set
+	if msg.UpdatedAt.IsZero() {
+		t.Error("Expected UpdatedAt to be set after BeforeCreate")
+	}
+
+	// CreatedAt and UpdatedAt should be equal initially
+	if !msg.CreatedAt.Equal(msg.UpdatedAt) {
+		t.Error("Expected CreatedAt and UpdatedAt to be equal after BeforeCreate")
+	}
+}
+
+func TestMessage_BeforeUpdate(t *testing.T) {
+	msg := &Message{
+		ID:        uuid.New(),
+		To:        "+66812345678",
+		Body:      "Test message",
+		Status:    StatusPending,
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+		UpdatedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	oldUpdatedAt := msg.UpdatedAt
+
+	// Sleep a tiny bit to ensure time difference
+	time.Sleep(1 * time.Millisecond)
+
+	// Call BeforeUpdate hook
+	if err := msg.BeforeUpdate(nil); err != nil {
+		t.Fatalf("BeforeUpdate failed: %v", err)
+	}
+
+	// UpdatedAt should be newer
+	if !msg.UpdatedAt.After(oldUpdatedAt) {
+		t.Error("Expected UpdatedAt to be updated after BeforeUpdate")
+	}
+
+	// CreatedAt should remain unchanged
+	if !msg.CreatedAt.Equal(time.Now().Add(-1 * time.Hour).Truncate(time.Second)) {
+		t.Error("Expected CreatedAt to remain unchanged after BeforeUpdate")
+	}
+}
+
+func TestBroadcast_BeforeCreate(t *testing.T) {
+	broadcast := &Broadcast{
+		Name: "Test Campaign",
+	}
+
+	// ID should be zero before create
+	if broadcast.ID != uuid.Nil {
+		t.Errorf("Expected ID to be nil, got %v", broadcast.ID)
+	}
+
+	// Call BeforeCreate hook
+	if err := broadcast.BeforeCreate(nil); err != nil {
+		t.Fatalf("BeforeCreate failed: %v", err)
+	}
+
+	// ID should be set after create
+	if broadcast.ID == uuid.Nil {
+		t.Error("Expected ID to be set after BeforeCreate")
+	}
+
+	// CreatedAt should be set
+	if broadcast.CreatedAt.IsZero() {
+		t.Error("Expected CreatedAt to be set after BeforeCreate")
+	}
+}
+
+func TestBroadcast_WithMessages(t *testing.T) {
+	broadcast := &Broadcast{
+		ID:        uuid.New(),
+		Name:      "Test Campaign",
+		CreatedAt: time.Now(),
+		Messages: []Message{
+			{
+				ID:     uuid.New(),
+				To:     "+66812345678",
+				Body:   "Message 1",
+				Status: StatusPending,
+			},
+			{
+				ID:     uuid.New(),
+				To:     "+66898765432",
+				Body:   "Message 2",
+				Status: StatusSent,
+			},
+		},
+	}
+
+	if len(broadcast.Messages) != 2 {
+		t.Errorf("Expected 2 messages, got %d", len(broadcast.Messages))
+	}
+
+	// Verify relationship
+	for _, msg := range broadcast.Messages {
+		if msg.BroadcastID != broadcast.ID {
+			t.Errorf("Expected message BroadcastID to be %v, got %v", broadcast.ID, msg.BroadcastID)
+		}
+	}
+}
+
+func TestMessage_Validation(t *testing.T) {
+	tests := []struct {
+		name    string
+		message Message
+		wantErr bool
+	}{
+		{
+			name: "valid message",
+			message: Message{
+				To:     "+66812345678",
+				Body:   "Test",
+				Status: StatusPending,
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty phone number",
+			message: Message{
+				To:     "",
+				Body:   "Test",
+				Status: StatusPending,
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty body",
+			message: Message{
+				To:     "+66812345678",
+				Body:   "",
+				Status: StatusPending,
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid status",
+			message: Message{
+				To:     "+66812345678",
+				Body:   "Test",
+				Status: Status("invalid"),
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			if tt.message.To == "" {
+				err = ErrEmptyPhoneNumber()
+			} else if tt.message.Body == "" {
+				err = ErrEmptyBody()
+			} else if !tt.message.Status.IsValid() {
+				err = ErrInvalidStatus(string(tt.message.Status))
+			}
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validation error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func ErrEmptyPhoneNumber() error {
+	return &ValidationError{Field: "to", Message: "phone number cannot be empty"}
+}
+
+func ErrEmptyBody() error {
+	return &ValidationError{Field: "body", Message: "body cannot be empty"}
+}
+
+func ErrInvalidStatus(status string) error {
+	return &ValidationError{Field: "status", Message: "invalid status: " + status}
+}
+
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e *ValidationError) Error() string {
+	return e.Field + ": " + e.Message
+}

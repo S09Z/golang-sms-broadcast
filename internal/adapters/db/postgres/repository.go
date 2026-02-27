@@ -2,148 +2,189 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"time"
 
 	"golang-sms-broadcast/internal/domain"
 
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-// Repository implements ports.MessageRepository using PostgreSQL.
+// Repository implements ports.MessageRepository using PostgreSQL with GORM.
 type Repository struct {
-	db *sql.DB
+	db *gorm.DB
 }
 
-// New opens a PostgreSQL connection and returns a Repository.
+// New opens a PostgreSQL connection using GORM and runs auto-migration.
 func New(dsn string) (*Repository, error) {
-	db, err := sql.Open("postgres", dsn)
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+		NowFunc: func() time.Time {
+			return time.Now().UTC()
+		},
+	})
 	if err != nil {
-		return nil, fmt.Errorf("open postgres: %w", err)
+		return nil, fmt.Errorf("open postgres with gorm: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// Get underlying SQL DB for connection pool settings
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, fmt.Errorf("get sql.DB from gorm: %w", err)
+	}
 
-	if err := db.Ping(); err != nil {
+	sqlDB.SetMaxOpenConns(25)
+	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+
+	// Verify connection
+	if err := sqlDB.Ping(); err != nil {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
+
+	// Auto-migrate schemas
+	fmt.Println("🔄 Running GORM auto-migration...")
+	if err := db.AutoMigrate(&domain.Broadcast{}, &domain.Message{}); err != nil {
+		return nil, fmt.Errorf("auto-migrate: %w", err)
+	}
+	fmt.Println("✅ Auto-migration complete")
 
 	return &Repository{db: db}, nil
 }
 
 // Close closes the underlying database connection pool.
 func (r *Repository) Close() error {
-	return r.db.Close()
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
+}
+
+// Ping checks if the database connection is alive.
+func (r *Repository) Ping(ctx context.Context) error {
+	sqlDB, err := r.db.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.PingContext(ctx)
 }
 
 // SaveBroadcast inserts a new broadcast row.
 func (r *Repository) SaveBroadcast(ctx context.Context, b domain.Broadcast) error {
-	const q = `
-		INSERT INTO broadcasts (id, name, created_at)
-		VALUES ($1, $2, $3)
-	`
-	_, err := r.db.ExecContext(ctx, q, b.ID, b.Name, b.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("insert broadcast: %w", err)
+	if err := r.db.WithContext(ctx).Create(&b).Error; err != nil {
+		return fmt.Errorf("create broadcast: %w", err)
 	}
 	return nil
 }
 
 // SaveMessages inserts a batch of messages inside a single transaction.
 func (r *Repository) SaveMessages(ctx context.Context, msgs []domain.Message) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	const q = `
-		INSERT INTO messages (id, broadcast_id, to_number, body, status, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`
-	stmt, err := tx.PrepareContext(ctx, q)
-	if err != nil {
-		return fmt.Errorf("prepare insert message: %w", err)
-	}
-	defer stmt.Close() //nolint:errcheck
-
-	for _, m := range msgs {
-		if _, err := stmt.ExecContext(ctx, m.ID, m.BroadcastID, m.To, m.Body, m.Status, m.CreatedAt, m.UpdatedAt); err != nil {
-			return fmt.Errorf("exec insert message %s: %w", m.ID, err)
-		}
+	if len(msgs) == 0 {
+		return nil
 	}
 
-	return tx.Commit()
+	if err := r.db.WithContext(ctx).CreateInBatches(msgs, 100).Error; err != nil {
+		return fmt.Errorf("create messages: %w", err)
+	}
+	return nil
 }
 
-// GetPendingMessages returns up to limit messages with status 'pending',
-// ordered by created_at ascending (oldest first).
+// GetPendingMessages returns up to limit messages with StatusPending.
 func (r *Repository) GetPendingMessages(ctx context.Context, limit int) ([]domain.Message, error) {
-	const q = `
-		SELECT id, broadcast_id, to_number, body, status, COALESCE(provider_id,''), created_at, updated_at
-		FROM messages
-		WHERE status = $1
-		ORDER BY created_at ASC
-		LIMIT $2
-		FOR UPDATE SKIP LOCKED
-	`
-	rows, err := r.db.QueryContext(ctx, q, domain.StatusPending, limit)
-	if err != nil {
-		return nil, fmt.Errorf("query pending: %w", err)
-	}
-	defer rows.Close()
-
 	var msgs []domain.Message
-	for rows.Next() {
-		var m domain.Message
-		var status string
-		if err := rows.Scan(&m.ID, &m.BroadcastID, &m.To, &m.Body, &status, &m.ProviderID, &m.CreatedAt, &m.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("scan message: %w", err)
-		}
-		m.Status = domain.Status(status)
-		msgs = append(msgs, m)
+	err := r.db.WithContext(ctx).
+		Where("status = ?", domain.StatusPending).
+		Order("created_at ASC").
+		Limit(limit).
+		Find(&msgs).Error
+
+	if err != nil {
+		return nil, fmt.Errorf("find pending messages: %w", err)
 	}
-	return msgs, rows.Err()
+	return msgs, nil
 }
 
-// UpdateMessageStatus transitions a message to the given status by internal ID.
+// UpdateMessageStatus transitions a message to the given status.
 func (r *Repository) UpdateMessageStatus(ctx context.Context, id uuid.UUID, status domain.Status) error {
-	const q = `UPDATE messages SET status = $1, updated_at = $2 WHERE id = $3`
-	res, err := r.db.ExecContext(ctx, q, status, time.Now().UTC(), id)
-	if err != nil {
-		return fmt.Errorf("update status: %w", err)
+	result := r.db.WithContext(ctx).
+		Model(&domain.Message{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"status":     status,
+			"updated_at": time.Now().UTC(),
+		})
+
+	if result.Error != nil {
+		return fmt.Errorf("update message status: %w", result.Error)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return domain.ErrMessageNotFound
+
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("message not found: %s", id)
 	}
+
 	return nil
 }
 
 // UpdateMessageStatusByProviderID transitions a message by the provider's external ID.
 func (r *Repository) UpdateMessageStatusByProviderID(ctx context.Context, providerID string, status domain.Status) error {
-	const q = `UPDATE messages SET status = $1, updated_at = $2 WHERE provider_id = $3`
-	res, err := r.db.ExecContext(ctx, q, status, time.Now().UTC(), providerID)
-	if err != nil {
-		return fmt.Errorf("update status by provider id: %w", err)
+	result := r.db.WithContext(ctx).
+		Model(&domain.Message{}).
+		Where("provider_id = ?", providerID).
+		Updates(map[string]interface{}{
+			"status":     status,
+			"updated_at": time.Now().UTC(),
+		})
+
+	if result.Error != nil {
+		return fmt.Errorf("update message status by provider id: %w", result.Error)
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return domain.ErrMessageNotFound
+
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("message not found for provider_id: %s", providerID)
 	}
+
 	return nil
 }
 
-// SetProviderID stores the external SMS provider ID on a message.
+// SetProviderID stores the external SMS provider ID on a message after submission.
 func (r *Repository) SetProviderID(ctx context.Context, id uuid.UUID, providerID string) error {
-	const q = `UPDATE messages SET provider_id = $1, updated_at = $2 WHERE id = $3`
-	_, err := r.db.ExecContext(ctx, q, providerID, time.Now().UTC(), id)
-	if err != nil {
-		return fmt.Errorf("set provider id: %w", err)
+	result := r.db.WithContext(ctx).
+		Model(&domain.Message{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"provider_id": providerID,
+			"updated_at":  time.Now().UTC(),
+		})
+
+	if result.Error != nil {
+		return fmt.Errorf("set provider id: %w", result.Error)
 	}
+
+	if result.RowsAffected == 0 {
+		return fmt.Errorf("message not found: %s", id)
+	}
+
 	return nil
+}
+
+// GetBroadcast retrieves a broadcast by ID with all its messages.
+func (r *Repository) GetBroadcast(ctx context.Context, id uuid.UUID) (*domain.Broadcast, error) {
+	var broadcast domain.Broadcast
+	err := r.db.WithContext(ctx).
+		Preload("Messages").
+		Where("id = ?", id).
+		First(&broadcast).Error
+
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return nil, fmt.Errorf("broadcast not found: %s", id)
+		}
+		return nil, fmt.Errorf("get broadcast: %w", err)
+	}
+
+	return &broadcast, nil
 }
